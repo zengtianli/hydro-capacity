@@ -7,10 +7,13 @@ Web 界面版本 - 纳污能力计算（Streamlit）
 启动方式：streamlit run app.py
 """
 
-import streamlit as st
-import pandas as pd
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import streamlit as st
+import pandas as pd
 
 from src.common.st_utils import page_config, excel_download, footer
 
