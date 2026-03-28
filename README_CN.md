@@ -4,6 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://python.org)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.36+-FF4B4B.svg)](https://streamlit.io)
+[![在线演示](https://img.shields.io/badge/%E5%9C%A8%E7%BA%BF%E6%BC%94%E7%A4%BA-hydro--capacity.tianlizeng.cloud-brightgreen)](https://hydro-capacity.tianlizeng.cloud)
 
 河道/水库纳污能力计算工具，支持支流分段和多方案计算。
 
@@ -37,7 +38,7 @@ nohup streamlit run app.py --server.port 8501 --server.headless true &
 
 ## Hydro Toolkit 插件
 
-本项目是 [Hydro Toolkit](https://github.com/zengtianli/hydro-toolkit) 的插件，也可独立运行。在 Toolkit 的插件管理页面粘贴本仓库 URL 即可安装。
+本项目是 [Hydro Toolkit](https://github.com/zengtianli/hydro-toolkit) 的插件，也可独立运行。在 Toolkit 的插件管理页面粘贴本仓库 URL 即可安装。也可以直接**[在线体验](https://hydro-capacity.tianlizeng.cloud)**，无需安装。
 
 ## 许可证
 
