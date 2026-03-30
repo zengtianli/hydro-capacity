@@ -18,7 +18,7 @@
 
 ---
 
-![hydro-capacity demo](docs/screenshots/demo.svg)
+![hydro-capacity demo](docs/screenshots/demo.png)
 
         ---
 
