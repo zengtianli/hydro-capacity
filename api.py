@@ -5,14 +5,17 @@ Run:
 """
 from __future__ import annotations
 
+import base64
 import io
+import json
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -76,6 +79,49 @@ def _add_unit(df: pd.DataFrame, unit: str, col_names: list | None = None) -> pd.
         elif col == "年平均":
             rename_map[col] = f"年平均({unit})"
     return df.rename(columns=rename_map)
+
+
+def _df_to_json_safe(df: pd.DataFrame, limit: int | None = None) -> dict:
+    """DataFrame → {columns, rows, totalRows}. Handles NaN / datetime / numpy types."""
+    total = len(df)
+    sliced = df.head(limit) if limit is not None and total > limit else df
+    parsed = json.loads(sliced.to_json(orient="split", date_format="iso", force_ascii=False))
+    return {"columns": parsed["columns"], "rows": parsed["data"], "totalRows": total}
+
+
+def _zones_preview(zones: list) -> dict:
+    rows = [
+        {
+            "功能区": z.zone_id,
+            "干流名": z.main_name,
+            "Cs": z.Cs,
+            "K(1/s)": z.K,
+            "b": z.b,
+            "a": z.a,
+            "β": z.beta,
+            "干流长度L(m)": z.length,
+            "干流C0": z.C0,
+            "支流数": len(z.branches) if z.branches else 0,
+        }
+        for z in zones
+    ]
+    return _df_to_json_safe(pd.DataFrame(rows))
+
+
+def _branches_preview(zones: list) -> dict:
+    rows = []
+    for z in zones:
+        for br in z.branches or []:
+            rows.append(
+                {
+                    "功能区": z.zone_id,
+                    "支流名": br.name,
+                    "长度L(m)": br.length,
+                    "汇入位置(m)": br.join_position,
+                    "C0": br.C0,
+                }
+            )
+    return _df_to_json_safe(pd.DataFrame(rows))
 
 
 def _run_capacity(xlsx_bytes: bytes) -> tuple[bytes, int, int]:
@@ -148,12 +194,112 @@ def _run_capacity(xlsx_bytes: bytes) -> tuple[bytes, int, int]:
     return out.getvalue(), len(zones), scheme_count
 
 
+def _run_capacity_full(xlsx_bytes: bytes) -> dict:
+    """Full pipeline that also exposes Streamlit's Step 2 previews and per-sheet data.
+
+    Returns a dict with `preview` / `meta` / `results` / `xlsxBase64`.
+    """
+    started = time.perf_counter()
+    upload_buf = io.BytesIO(xlsx_bytes)
+
+    ws_data = read_input_sheet_raw(upload_buf)
+    zones, scheme_count = parse_input_sheet(ws_data)
+
+    upload_buf.seek(0)
+    xlsx = pd.ExcelFile(upload_buf)
+
+    flow_sheets = parse_flow_sheets(xlsx, scheme_count)
+    if not flow_sheets:
+        raise HTTPException(400, "未找到逐日流量 sheet（需包含'逐日流量'和'方案N'）")
+
+    reservoir_zones, reservoir_volume_df = parse_reservoir_input(xlsx)
+
+    zone_ids = [z.zone_id for z in zones]
+    sample_flow = list(flow_sheets.values())[0]
+    flow_col_map = get_flow_column_map(zones, list(sample_flow.columns))
+
+    all_flow_cols: list[str] = []
+    for info in flow_col_map.values():
+        all_flow_cols.append(info["main"])
+        all_flow_cols.extend(info["branches"])
+
+    all_scheme_results: dict[str, pd.DataFrame] = {}
+    for s_num in range(1, scheme_count + 1):
+        daily_flow = flow_sheets[s_num]
+        prefix = f"方案{s_num}" if scheme_count > 1 else ""
+        tag = f"（{prefix}）" if prefix else ""
+
+        calc_monthly_flow(daily_flow, all_flow_cols)
+        daily_cap, seg_accum = calc_daily_capacity_with_segments(daily_flow, zones, flow_col_map)
+        daily_cap_with_month = daily_cap.copy()
+        daily_cap_with_month["年"] = daily_cap_with_month["日期"].dt.year
+        daily_cap_with_month["月"] = daily_cap_with_month["日期"].dt.month
+        monthly_cap = daily_cap_with_month.groupby(["年", "月"])[zone_ids].mean().reset_index()
+        zone_avg_cap = calc_zone_monthly_avg(monthly_cap, zone_ids, is_capacity=True)
+        process_table = build_process_table(seg_accum, zones)
+        result_table = build_result_table(seg_accum, zones)
+
+        all_scheme_results[f"逐日纳污能力{tag}"] = daily_cap
+        all_scheme_results[f"逐月纳污能力{tag}"] = _add_unit(monthly_cap, "t/a", zone_ids)
+        all_scheme_results[f"功能区月平均纳污能力{tag}"] = _add_unit(zone_avg_cap, "t/a")
+        all_scheme_results[f"纳污能力过程{tag}"] = process_table
+        all_scheme_results[f"纳污能力结果{tag}"] = result_table
+
+    has_reservoir = bool(reservoir_zones) and reservoir_volume_df is not None
+    if has_reservoir:
+        r_zone_ids = [z.zone_id for z in reservoir_zones]
+        monthly_vol = calc_reservoir_monthly_volume(reservoir_volume_df, r_zone_ids)
+        r_monthly_cap = calc_reservoir_monthly_capacity(monthly_vol, reservoir_zones)
+        r_zone_avg = calc_reservoir_zone_monthly_avg(r_monthly_cap, r_zone_ids)
+        all_scheme_results["水库逐月库容(m³)"] = _add_unit(monthly_vol, "m³", r_zone_ids)
+        all_scheme_results["水库月平均纳污能力"] = _add_unit(r_zone_avg, "t/a")
+
+    # Build xlsx
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        for name, df in all_scheme_results.items():
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+    xlsx_bytes_out = out.getvalue()
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    # 逐日表只回前 500 行给前端展示，完整数据在 xlsx 里
+    DAILY_DISPLAY_LIMIT = 500
+    results_payload: dict[str, dict] = {}
+    for name, df in all_scheme_results.items():
+        limit = DAILY_DISPLAY_LIMIT if "逐日" in name else None
+        results_payload[name] = _df_to_json_safe(df, limit=limit)
+
+    return {
+        "preview": {
+            "zones": _zones_preview(zones),
+            "branches": _branches_preview(zones),
+            "flowHead": _df_to_json_safe(sample_flow, limit=10),
+        },
+        "meta": {
+            "zoneCount": len(zones),
+            "schemeCount": scheme_count,
+            "hasReservoir": has_reservoir,
+            "elapsedMs": elapsed_ms,
+            "xlsxBytes": len(xlsx_bytes_out),
+        },
+        "results": results_payload,
+        "xlsxBase64": base64.b64encode(xlsx_bytes_out).decode("ascii"),
+    }
+
+
 @app.post("/api/compute")
-async def compute(file: UploadFile = File(..., description="输入.xlsx")) -> Response:
+async def compute(
+    file: UploadFile = File(..., description="输入.xlsx"),
+    format: str = Form("xlsx", description="xlsx (binary) | json (preview+results+base64)"),
+) -> Response:
     content = await file.read()
     if not content:
         raise HTTPException(400, "上传文件为空")
     try:
+        if format == "json":
+            payload = _run_capacity_full(content)
+            return JSONResponse(content=payload)
         xlsx_bytes, zone_count, scheme_count = _run_capacity(content)
     except HTTPException:
         raise
